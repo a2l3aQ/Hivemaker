@@ -1,24 +1,26 @@
 # Hivemaker
 
-I am still working on setting this repo up. It may not work.
+HTTTX game engine, bot framework, and test UI for infinite hexagonal tic-tac-toe.
 
-Infinite hexagonal tic-tac-toe engine with a WebSocket bot API and PyQt5 test UI.
-
-Partially implements the [HTTTX Bot API `basic_websocket` v1-alpha spec](https://github.com/hex-tic-tac-toe/htttx-bot-api/blob/main/definitions/basic_websocket/bws-v1-alpha.yaml).
+Partially implements the [HTTTX Bot API `basic_websocket` v1-alpha spec](https://github.com/hex-tic-tac-toe/htttx-bot-api/blob/main/definitions/basic_websocket/bws-v1-alpha.yaml). See [Spec compliance](#spec-compliance) for details.
 
 ---
 
 ## Architecture
 
 ```
-game/serve.py   FastAPI + WebSocket game server      (port 8001)
-bot/serve.py    Example bot server (CenterBot)       (port 8002)
-ui/app.py       PyQt5 desktop client
-models.py       Shared data types
-game/game.py    Pure game logic (no IO)
+game/serve.py        FastAPI + WebSocket game server       (port 8001)
+bot/serve.py         Bot server — websockets + HTTP        (port 8002)
+bot/bot.py           BaseBot (ABC) + CenterBot (example)
+bot/capabilities.py  Capabilities schema + builder
+ui/app.py            PyQt5 desktop client
+models.py            Shared data types
+game/game.py         Pure game logic (no IO)
 ```
 
-The game server is the sole authority on board state. It connects **outward** to bot servers. The UI implements the same wire protocol as a bot. From the server's perspective, a human and a bot are identical.
+The game server is the sole authority on board state. It connects **outward** to bot servers — bots do not initiate connections to the game server. The UI implements the same wire protocol as a bot. From the server's perspective, a human and a bot are identical.
+
+Bot servers serve both HTTP (`GET /capabilities.json`) and WebSocket (`/bws/v1-alpha/game`) on the same port. The game server fetches capabilities before connecting to resolve the correct WebSocket path.
 
 ---
 
@@ -42,9 +44,9 @@ hex_distance(q1,r1, q2,r2) = max(|q1-q2|, |r1-r2|, |(-q1-r1)-(-q2-r2)|)
 
 ## Setup
 
-Python version: 3.14.3
-
-Install requirements.txt
+```
+pip install fastapi uvicorn websockets pydantic PyQt5
+```
 
 ```bash
 python -m bot.serve    # port 8002
@@ -58,7 +60,9 @@ python -m ui.app
 
 ### Connection
 
-The game server opens one WebSocket connection per game to the configured bot URL. One connection = one session. The bot may start a fresh session on connection, or wait for the `setup` packet to match against cached state.
+The game server fetches `GET /capabilities.json` from the bot's HTTP base URL, resolves the WebSocket path from `basic_websocket.versions.v1-alpha.api_root` (default: `bws/v1-alpha/game`), then opens one WebSocket connection per game session.
+
+One connection = one session. Concurrent games = concurrent connections. Session ends when the connection closes.
 
 All messages are JSON, discriminated by `type`.
 
@@ -91,9 +95,8 @@ Sent when it is the bot's turn. The bot must respond with exactly one `move_resp
       "pieces": [{ "q": 1, "r": 0 }, { "q": -1, "r": 0 }]
     }
   ],
-  "board": {
-    "cells": [...]
-  }
+  "board": { "cells": [...] },
+  "move_time_limit": 5.0
 }
 ```
 
@@ -101,10 +104,11 @@ Sent when it is the bot's turn. The bot must respond with exactly one `move_resp
 |---|---|---|
 | `side` | `"x"` \| `"o"` | Side the bot is playing. Consistent across the session. |
 | `previous` | `Move[]` | Ordered moves applied since the last `move_request`. Empty on the bot's first move. |
-| `board` | `Board` | Authoritative full board state. Can be used instead of tracking `previous`. |
+| `board` | `Board` | Authoritative full board state. Prefer this over tracking `previous`. |
+| `move_time_limit` | `float \| null` | Seconds the bot has to respond. Only sent if bot declares `move_time_limit: true` in capabilities. |
 
 #### `heartbeat`
-Sent every `heartbeat` ms (default: 5000). No response required. If `waiting` is `true` and the bot is not processing a `move_request`, an error state has occurred and the bot should terminate the connection.
+Sent every `heartbeat` ms (default: 5000). No response required. If `waiting` is `true` and the bot is not processing a `move_request`, an error state has occurred — the bot must terminate the connection immediately.
 
 ```json
 { "type": "heartbeat", "waiting": true }
@@ -128,8 +132,10 @@ Sent when the game ends for any reason.
 | `"draw"` | `null` |
 | `"forfeit"` | the non-forfeiting player |
 
+`board` in the `end` packet is a Hivemaker extension — not in the base spec.
+
 #### `nope`
-Sent on protocol violation. Connection is closed immediately after. The bot's player forfeits.
+Sent on protocol violation. Connection is closed immediately after.
 
 ```json
 { "type": "nope", "reason": "string" }
@@ -164,10 +170,10 @@ Must be sent in response to `move_request`, and only then. Contains exactly 2 pi
 | Field | Required | Description |
 |---|---|---|
 | `move.pieces` | yes | Exactly 2 unoccupied coords within `view_distance` of any existing piece |
-| `move.evaluation` | no | Position evaluation after this move |
+| `move.evaluation` | no | Position evaluation after this move is applied |
 | `considerations` | no | Additional moves considered, ordered best to worst |
 
-`evaluation.heuristic`: any real number, positive = X advantage, negative = O advantage. Suggested range `[-1, 1]` but not enforced.  
+`evaluation.heuristic`: real number, positive = X advantage, negative = O advantage. Suggested range `[-1, 1]`, not enforced.
 `evaluation.win_in`: integer. Positive = X wins in N moves, negative = O wins in N moves. One move = 2 pieces placed.
 
 ---
@@ -183,55 +189,108 @@ Move    { side: "x" | "o", pieces: [Coord, Coord] }
 
 ---
 
+## Capabilities
+
+Bot servers must serve `GET /capabilities.json`. The game server fetches this before connecting.
+
+Minimal example declaring bws v1-alpha support:
+
+```json
+{
+  "meta": {
+    "name": "MyBot",
+    "tags": ["minimax"]
+  },
+  "basic_websocket": {
+    "versions": {
+      "v1-alpha": {}
+    }
+  }
+}
+```
+
+With optional features declared:
+
+```json
+{
+  "basic_websocket": {
+    "versions": {
+      "v1-alpha": {
+        "api_root": "bws/v1-alpha",
+        "move_time_limit": true,
+        "evaluation": true,
+        "config": {}
+      }
+    }
+  }
+}
+```
+
+---
+
 ## Python base class
 
-Subclass `BaseBot` in `bot/bot.py` to skip all protocol handling:
+Subclass `BaseBot` in `bot/bot.py`. It handles all protocol details — config, setup, heartbeat, move timing, eval, end/nope termination.
 
 ```python
-from bot.bot import BaseBot
+from bot.bot import BaseBot, PositionEvaluation
+from bot.capabilities import BwsV1AlphaCapability, Capabilities, Meta, default_capabilities
 from models import Cell, Coord, Match, Player
 from game.game import valid_placement_cells
 
 class MyBot(BaseBot):
+
+    @classmethod
+    def capabilities(cls) -> Capabilities:
+        caps = default_capabilities(BwsV1AlphaCapability(
+            move_time_limit=True,
+            evaluation=True,
+        ))
+        caps.meta = Meta(name="MyBot", tags=["minimax"])
+        return caps
+
     def choose_move(
         self,
-        cells: list[Cell],   # current board
-        player: Player,       # Player.X or Player.O
-        match: Match,         # game config
+        cells: list[Cell],
+        player: Player,
+        match: Match,
     ) -> tuple[Coord, Coord]:
         candidates = valid_placement_cells(cells, match.view_distance)
         # ... your logic
         return candidates[0], candidates[1]
+
+    def evaluate(
+        self,
+        cells: list[Cell],
+        player: Player,
+        match: Match,
+    ) -> PositionEvaluation:
+        # only needed if evaluation=True in capabilities
+        return PositionEvaluation(heuristic=0.0)
+
+    def on_config(self, depth: int | None, extras: dict) -> None:
+        # only needed if config={} in capabilities
+        if depth is not None:
+            self.depth = depth
 ```
 
-Serve it:
+Serve it by setting `BOT_CLASS` in `bot/serve.py`:
 
 ```python
-import asyncio, websockets
 from my_bot import MyBot
-
-async def handler(ws):
-    await MyBot().handle(ws)
-
-async def main():
-    async with websockets.serve(handler, "0.0.0.0", 8002):
-        await asyncio.Future()
-
-asyncio.run(main())
+BOT_CLASS: type[BaseBot] = MyBot
 ```
 
-`BaseBot.handle()` applies `previous` moves, calls `choose_move`, sends the response, and handles `end`/`nope` termination. It creates no shared state — each call to `handle()` is independent, concurrent games work without any extra threading.
-
-**`Match` fields:**
+**`Match` fields available in `choose_move`:**
 
 | Field | Default | Type |
 |---|---|---|
-| `view_distance` | 8 | `int` |
-| `win_distance` | 6 | `int` |
-| `heartbeat` | 5000 | `int` (ms) |
+| `view_distance` | 8 | `int` — max hex steps from any piece for placement |
+| `win_distance` | 6 | `int` — pieces in a row to win |
+| `heartbeat` | 5000 | `int` — ms between heartbeats |
 | `turn_limit` | `null` | `int \| None` |
 | `clock_type` | `"none"` | `"none" \| "match" \| "turn" \| "incremental"` |
-| `clock` | `null` | `float \| None` (seconds) |
+| `clock` | `null` | `float \| None` — seconds |
 
 **Helpers in `game/game.py`:**
 
@@ -254,7 +313,7 @@ Content-Type: application/json
 
 ```json
 {
-  "player_x": { "type": "bot", "bot_url": "ws://localhost:8002" },
+  "player_x": { "type": "bot", "bot_url": "http://localhost:8002" },
   "player_o": { "type": "human" },
   "match_config": {
     "heartbeat": 5000,
@@ -280,7 +339,7 @@ Token is returned only for human player slots. Connect as human:
 ws://localhost:8001/ws?token=<token>
 ```
 
-Spectate a running game (receives `board_update` and `end`, read-only):
+Spectate a running game (read-only, receives `board_update` and `end`):
 ```
 ws://localhost:8001/spectate/<game_id>
 ```
@@ -293,18 +352,26 @@ Implements [bws-v1-alpha](https://github.com/hex-tic-tac-toe/htttx-bot-api/blob/
 
 | Feature | Status | Notes |
 |---|---|---|
-| `capabilities.json` | ✅ | |
 | `setup` packet | ✅ | |
 | `move_request` / `move_response` | ✅ | |
 | `heartbeat` with `waiting` | ✅ | |
 | `nope` on violation | ✅ | |
 | `end` packet | ✅ | Non-standard `board` field added |
+| `capabilities.json` endpoint | ✅ | Served on same port as WebSocket |
+| `capabilities` schema | ✅ | `meta`, `basic_websocket.versions.v1-alpha` |
+| `api_root` resolution | ✅ | Game server fetches and follows `api_root` |
+| `move_time_limit` from packet | ✅ | Respected if declared in capabilities |
+| `config` packet | ✅ | `on_config()` override, `dynamic` not enforced |
 | `move_response.considerations` | ✅ | Passed through; not populated by `CenterBot` |
 | `move_response.evaluation` | ✅ | Passed through; not populated by `CenterBot` |
-| `config` packet | ⚠️ | Received, silently ignored |
-| `eval_request` / `eval_response` | ❌ | Not implemented |
-| `move_time_limit` from packet | ⚠️ | Hardcoded 60s server-side; packet field ignored |
-| Bot endpoint path | ⚠️ | Spec defines `/game`; implementation accepts on any path |
+| `eval_request` / `eval_response` | ✅ | `evaluate()` override, declare `evaluation: true` |
+| `evaluation_time_limit` | ✅ | Respected if declared in capabilities |
+| `move_skips` | ❌ | Not declared; bot applies own move immediately |
+| `dual_sided` | ❌ | Not implemented |
+| `free_move_order` | ❌ | Not implemented |
+| `free_setup` | ❌ | Setup always contains exactly X at origin |
+| `resettable_state` | ❌ | Setup may only be sent once |
+| `interruptible` | ❌ | Not implemented |
 
 ---
 
@@ -314,10 +381,11 @@ Implements [bws-v1-alpha](https://github.com/hex-tic-tac-toe/htttx-bot-api/blob/
 models.py                  Cell, Coord, Match, Player, PlayerConfig, GameStatus, NewGameRequest
 game/
   game.py                  Stateless game logic
-  serve.py                 Game server — manages sessions, drives turn loop
+  serve.py                 Game server — manages sessions, drives turn loop, fetches bot capabilities
 bot/
   bot.py                   BaseBot (ABC) + CenterBot (placeholder)
-  serve.py                 Example bot server
+  capabilities.py          Capabilities schema (Pydantic) + default builder
+  serve.py                 Bot server — websockets + HTTP on one port
 ui/
   app.py                   Entry point
   main_window.py           Window layout, wires signals
