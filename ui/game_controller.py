@@ -34,6 +34,9 @@ class _WsWorker(QThread):
         self._queue = asyncio.Queue()
         try:
             self._loop.run_until_complete(self._connect())
+        except RuntimeError as e:
+            if "Event loop stopped" not in str(e):
+                self.error.emit(str(e))
         except Exception as e:
             import websockets
             if not isinstance(e, websockets.exceptions.ConnectionClosedOK):

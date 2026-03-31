@@ -45,7 +45,7 @@ class PlayerPanel(QWidget):
         url_layout = QHBoxLayout(self._url_row)
         url_layout.setContentsMargins(0, 0, 0, 0)
         url_layout.addWidget(QLabel("URL:"))
-        self._url_edit = QLineEdit("ws://localhost:8002")
+        self._url_edit = QLineEdit("http://localhost:8002")
         self._url_edit.editingFinished.connect(
             lambda: self.config_changed.emit(self.get_config())
         )

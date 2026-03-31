@@ -6,14 +6,58 @@ import json
 import uuid
 import uvicorn
 import websockets
+import urllib.request
+import urllib.parse
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.websockets import WebSocketState
-from models import Cell, Coord, GameStatus, Match, NewGameRequest, Player, PlayerConfig, PlayerType
+from models import Cell, Coord, GameStatus, Match, NewGameRequest, Player, PlayerType
 from game.game import evaluate_status, is_valid_placement, place_piece
 
 app = FastAPI(title="HTTTX Game Server")
 _games: dict[str, "GameSession"] = {}
 _tokens: dict[str, tuple[str, Player]] = {}
+
+DEFAULT_BWS_PATH = "bws/v1-alpha/game"
+
+
+def _http_from_ws(ws_url: str) -> str:
+    """ws://host → http://host, wss://host → https://host"""
+    return ws_url.replace("ws://", "http://").replace("wss://", "https://")
+
+
+def _ws_from_http(http_url: str) -> str:
+    return http_url.replace("http://", "ws://").replace("https://", "wss://")
+
+
+def _resolve_bot_ws_url(bot_url: str) -> str:
+    """
+    Fetch /capabilities.json from the bot's HTTP base URL and resolve
+    the correct WebSocket path from basic_websocket.versions.v1-alpha.api_root.
+    Falls back to DEFAULT_BWS_PATH if capabilities are unavailable.
+    """
+    # Derive HTTP base from whatever URL format was provided
+    if bot_url.startswith("ws"):
+        http_base = _http_from_ws(bot_url).rstrip("/")
+    else:
+        http_base = bot_url.rstrip("/")
+
+    try:
+        with urllib.request.urlopen(
+            f"{http_base}/capabilities.json", timeout=3
+        ) as resp:
+            caps = json.loads(resp.read())
+
+        bws_versions = (
+            caps.get("basic_websocket", {})
+                .get("versions", {})
+                .get("v1-alpha", {})
+        )
+        api_root = bws_versions.get("api_root", DEFAULT_BWS_PATH).strip("/")
+        return _ws_from_http(f"{http_base}/{api_root}/game")
+
+    except Exception as e:
+        print(f"[capabilities] could not fetch from {http_base}: {e} — using default path")
+        return _ws_from_http(f"{http_base}/{DEFAULT_BWS_PATH}")
 
 
 def _wire_board(cells: list[Cell]) -> dict:
@@ -35,7 +79,7 @@ class PlayerSlot:
 class GameSession:
     def __init__(
         self, game_id: str, match: Match,
-        config_x: PlayerConfig, config_o: PlayerConfig
+        config_x, config_o,
     ):
         self.game_id = game_id
         self.match = match
@@ -43,7 +87,7 @@ class GameSession:
             Player.X: PlayerSlot(config_x.type == PlayerType.BOT),
             Player.O: PlayerSlot(config_o.type == PlayerType.BOT),
         }
-        self.cells: list[Cell] = [Cell(q=0, r=0, p=Player.X)]  # X origin auto-placed
+        self.cells: list[Cell] = [Cell(q=0, r=0, p=Player.X)]
         self.to_move: Player = Player.O
         self.status = GameStatus.IN_PROGRESS
         self.turn_count = 0
@@ -79,7 +123,7 @@ class GameSession:
         await self._send(Player.O, setup)
 
         heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        last_turn: dict | None = None  # wire move of last completed turn
+        last_turn: dict | None = None
 
         try:
             while self.status == GameStatus.IN_PROGRESS:
@@ -92,7 +136,7 @@ class GameSession:
                     placed = await self._human_turn(current, previous)
 
                 if placed is None:
-                    return  # error already handled inside turn methods
+                    return
 
                 last_turn = _wire_move(current, placed)
                 self.turn_count += 1
@@ -121,23 +165,24 @@ class GameSession:
             else None
         )
         await self._end(winner, "win" if winner else "draw")
+        _games.pop(self.game_id, None)
 
     async def _bot_turn(
         self, player: Player, previous: list[dict]
     ) -> list[Coord] | None:
-        """Send one move_request, expect move_response with 2 pieces."""
+        time_limit = self.match.clock if self.match.clock_type == "turn" else None
         await self._send(player, {
             "type": "move_request",
             "side": player.value,
             "previous": previous,
             "board": _wire_board(self.cells),
+            **({"move_time_limit": time_limit} if time_limit else {}),
         })
 
-        response = await self._recv(player, timeout=60)
+        response = await self._recv(player, timeout=(time_limit or 0) + 10 if time_limit else 60)
         if response is None:
             await self._forfeit(player)
             return None
-
         if response.get("type") != "move_response":
             await self._nope(player, "expected move_response")
             return None
@@ -165,12 +210,10 @@ class GameSession:
     async def _human_turn(
         self, player: Player, previous: list[dict]
     ) -> list[Coord] | None:
-        """Send two move_requests, expect move_response with 1 piece each."""
         placed: list[Coord] = []
 
         for i in range(2):
             prev = previous if i == 0 else [_wire_move(player, placed)]
-
             await self._send(player, {
                 "type": "move_request",
                 "side": player.value,
@@ -182,7 +225,6 @@ class GameSession:
             if response is None:
                 await self._forfeit(player)
                 return None
-
             if response.get("type") != "move_response":
                 await self._nope(player, "expected move_response")
                 return None
@@ -230,7 +272,6 @@ class GameSession:
         for q in self._spectators:
             await q.put(pkt)
             await q.put(None)
-        _games.pop(self.game_id, None)
 
     async def _nope(self, player: Player, reason: str):
         await self.slots[player].outgoing.put(
@@ -247,8 +288,13 @@ class GameSession:
 
 async def _run_bot_slot(session: GameSession, player: Player, bot_url: str):
     slot = session.slots[player]
+    # Resolve actual WS URL via capabilities (runs in thread to avoid blocking loop)
+    ws_url = await asyncio.get_event_loop().run_in_executor(
+        None, _resolve_bot_ws_url, bot_url
+    )
+    print(f"[bot {player.value}] connecting to {ws_url}")
     try:
-        async with websockets.connect(bot_url) as ws:
+        async with websockets.connect(ws_url) as ws:
             slot.connected.set()
 
             async def sender():
@@ -283,7 +329,7 @@ async def new_game(req: NewGameRequest) -> dict:
     for player, config in [(Player.X, req.player_x), (Player.O, req.player_o)]:
         if config.type == PlayerType.BOT:
             asyncio.create_task(
-                _run_bot_slot(session, player, config.bot_url or "ws://localhost:8002")
+                _run_bot_slot(session, player, config.bot_url or "http://localhost:8002")
             )
         else:
             token = str(uuid.uuid4())
