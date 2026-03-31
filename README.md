@@ -44,6 +44,8 @@ hex_distance(q1,r1, q2,r2) = max(|q1-q2|, |r1-r2|, |(-q1-r1)-(-q2-r2)|)
 
 ## Setup
 
+python version: 3.14.3
+
 ```
 pip install fastapi uvicorn websockets pydantic PyQt5
 ```
