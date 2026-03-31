@@ -293,6 +293,7 @@ Implements [bws-v1-alpha](https://github.com/hex-tic-tac-toe/htttx-bot-api/blob/
 
 | Feature | Status | Notes |
 |---|---|---|
+| `capabilities.json` | ✅ | |
 | `setup` packet | ✅ | |
 | `move_request` / `move_response` | ✅ | |
 | `heartbeat` with `waiting` | ✅ | |
@@ -304,7 +305,6 @@ Implements [bws-v1-alpha](https://github.com/hex-tic-tac-toe/htttx-bot-api/blob/
 | `eval_request` / `eval_response` | ❌ | Not implemented |
 | `move_time_limit` from packet | ⚠️ | Hardcoded 60s server-side; packet field ignored |
 | Bot endpoint path | ⚠️ | Spec defines `/game`; implementation accepts on any path |
-| `capabilities.json` | ❌ | Not implemented |
 
 ---
 
